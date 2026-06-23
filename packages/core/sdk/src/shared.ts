@@ -43,6 +43,7 @@ export type {
   ConnectionValueInput,
   CreateConnectionInput,
   UpdateConnectionInput,
+  ValidateConnectionInput,
 } from "./connection";
 export type { CredentialProvider, ProviderEntry } from "./provider";
 export type { Tool, ToolDef, ToolListFilter, ToolAnnotations } from "./tool";
@@ -98,6 +99,17 @@ export type { ToolPolicyAction } from "./core-schema";
 
 // Schema-side views + onboarding autodetect.
 export { ToolSchemaView, IntegrationDetectionResult } from "./types";
+
+// Health-check vocabulary (pure Schema + helpers).
+export {
+  HealthStatus,
+  HealthCheckSpec,
+  HealthCheckResult,
+  HealthCheckCandidate,
+  HealthCheckCandidateParameter,
+  classifyHttpStatus,
+  compareHealthCheckCandidates,
+} from "./health-check";
 
 // OAuth wire contracts (data + tagged errors; the flow impl is server-only).
 export {
