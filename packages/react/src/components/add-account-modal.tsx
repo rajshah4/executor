@@ -8,6 +8,7 @@ import {
   OAuthClientSlug,
   ProviderItemId,
   ProviderKey,
+  type HealthCheckResult,
   type OAuthClientSummary,
   type Owner,
 } from "@executor-js/sdk/shared";
@@ -17,6 +18,7 @@ import { toast } from "sonner";
 import {
   addConnectionOptimistic,
   connectionsAllAtom,
+  integrationHealthCheckAtom,
   oauthClientsOptimisticAtom,
   probeOAuth,
   providerItemsAtom,
@@ -24,6 +26,7 @@ import {
   registerDynamicOAuthClient,
   removeOAuthClientOptimistic,
   startOAuth,
+  validateConnection,
 } from "../api/atoms";
 import { connectionWriteKeys, oauthClientWriteKeys } from "../api/reactivity-keys";
 import { messageFromExit } from "../api/error-reporting";
@@ -47,6 +50,7 @@ import {
   type OAuthClientOption,
 } from "../plugins/use-effective-oauth-client";
 import { cn } from "../lib/utils";
+import { HEALTH_INDICATOR_COLOR, HEALTH_STATUS_LABEL } from "../lib/health-display";
 import { buildUsageMap, connectionsUsingClient } from "../lib/oauth-client-usage";
 import { OAuthClientForm, type OAuthClientFormPrefill } from "./oauth-client-form";
 import { RemoveOAuthAppDialog } from "./remove-oauth-app-dialog";
@@ -149,6 +153,9 @@ function PasteCredentialInputs(props: {
   readonly singleInput: boolean;
   readonly values: Readonly<Record<string, string>>;
   readonly onChange: (values: Record<string, string>) => void;
+  /** Fired when a credential field loses focus; the key-first flow uses this to
+   *  auto-validate a pasted key (and derive the name) once the user moves on. */
+  readonly onBlur?: () => void;
 }) {
   return (
     <div className="space-y-2">
@@ -168,6 +175,7 @@ function PasteCredentialInputs(props: {
                 [input.variable]: e.target.value,
               })
             }
+            onBlur={props.onBlur}
             className="font-mono"
             data-ph-block
           />
@@ -253,6 +261,8 @@ function CredentialValueFields(props: {
   readonly onOriginChange: (origin: CredentialOrigin) => void;
   readonly onePasswordItemId: string;
   readonly onOnePasswordItemIdChange: (value: string) => void;
+  /** Forwarded to the paste fields so the key-first flow can auto-validate on blur. */
+  readonly onPasteBlur?: () => void;
 }) {
   const providers = useAtomValue(providersAtom);
   const onePasswordAvailable = props.singleInput && isOnePasswordRegistered(providers);
@@ -293,8 +303,48 @@ function CredentialValueFields(props: {
           singleInput={props.singleInput}
           values={props.values}
           onChange={props.onValuesChange}
+          onBlur={props.onPasteBlur}
         />
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Key-first validation status: the inline line under the credential field that
+// reports the live probe result. `validating` shows a neutral "Checking..."; a
+// result shows the status dot + label, the probed identity (the account the key
+// belongs to), and any upstream detail for a non-healthy verdict.
+// ---------------------------------------------------------------------------
+function KeyValidationStatus(props: {
+  readonly validating: boolean;
+  readonly result: HealthCheckResult | null;
+}) {
+  if (props.validating) {
+    return (
+      <p className="flex items-center gap-2 text-xs text-muted-foreground">
+        <span className="size-2 shrink-0 animate-pulse rounded-full bg-muted-foreground/50" />
+        Checking the key...
+      </p>
+    );
+  }
+  if (!props.result) return null;
+  const { status, identity, detail } = props.result;
+  const indicator = HEALTH_INDICATOR_COLOR[status];
+  const tone = status === "healthy" ? "text-muted-foreground" : "text-destructive";
+  return (
+    <div className={`flex items-start gap-2 text-xs ${tone}`}>
+      <span aria-hidden className={`mt-[3px] size-2 shrink-0 rounded-full ${indicator.dot}`} />
+      <span className="min-w-0">
+        <span className="font-medium">{HEALTH_STATUS_LABEL[status]}</span>
+        {status === "healthy" && identity ? (
+          <>
+            {" · "}
+            <span className="text-foreground">{identity}</span>
+          </>
+        ) : null}
+        {status !== "healthy" && detail ? <span className="block opacity-80">{detail}</span> : null}
+      </span>
     </div>
   );
 }
@@ -644,6 +694,12 @@ export function AddAccountModal(props: {
   const [credentialOrigin, setCredentialOrigin] = useState<CredentialOrigin>("paste");
   const [onePasswordItemId, setOnePasswordItemId] = useState("");
   const [label, setLabel] = useState("");
+  // Key-first validation: whether the name field was auto-filled from a probed
+  // identity (so a later probe may overwrite it, but a hand-typed name is never
+  // clobbered), the in-flight probe state, and its last result.
+  const [nameAutofilled, setNameAutofilled] = useState(false);
+  const [validating, setValidating] = useState(false);
+  const [validationResult, setValidationResult] = useState<HealthCheckResult | null>(null);
   // Explicit create-time choice (no ambient owner). Cloud defaults to Personal;
   // local/desktop hide the picker and save to the one local workspace.
   const [owner, setOwner] = useState<Owner>(defaultOwner);
@@ -674,6 +730,15 @@ export function AddAccountModal(props: {
     mode: "promiseExit",
   });
   const doRemoveOAuthClient = useAtomSet(removeOAuthClientOptimistic, { mode: "promise" });
+  const doValidate = useAtomSet(validateConnection, { mode: "promiseExit" });
+
+  // The integration's declared health check, if any. Key-first validation runs
+  // it against the pasted credential, so the "Validate key" affordance only
+  // appears once a check is configured (the editor sets one up). No check ⇒ the
+  // probe can only ever return "unknown", so we hide the affordance entirely.
+  const healthCheckResult = useAtomValue(integrationHealthCheckAtom(integration));
+  const hasHealthCheck =
+    AsyncResult.isSuccess(healthCheckResult) && healthCheckResult.value !== null;
 
   // Full registered-app summaries (carry endpoints + resource the picker's
   // lightweight options omit) and the connection→app usage map that powers the
@@ -861,6 +926,9 @@ export function AddAccountModal(props: {
     setCredentialOrigin("paste");
     setOnePasswordItemId("");
     setLabel("");
+    setNameAutofilled(false);
+    setValidating(false);
+    setValidationResult(null);
     setOwner(defaultOwner);
     setSubmitting(false);
     setPickedApp(null);
@@ -913,6 +981,14 @@ export function AddAccountModal(props: {
     setValues({});
     setCredentialOrigin("paste");
     setOnePasswordItemId("");
+    setValidationResult(null);
+  };
+
+  // A pasted credential changed; the prior verdict (and any name derived from
+  // it) is stale. Clear the result; keep an auto-filled name so the user sees a
+  // sensible default until the next probe, but let a re-probe overwrite it.
+  const onCredentialChanged = (): void => {
+    if (validationResult !== null) setValidationResult(null);
   };
 
   // A just-created custom method joins the in-session list and is auto-selected
@@ -1005,6 +1081,60 @@ export function AddAccountModal(props: {
     }
     toast.success("Connection added");
     close();
+  };
+
+  // Key-first validation: run the integration's health check against the pasted
+  // credential WITHOUT saving it, then derive the connection name from the
+  // identity the probe returns. The name is only auto-filled when it is still
+  // empty or was a prior auto-fill, so a hand-typed name is never overwritten.
+  const handleValidate = async () => {
+    const payloadOrigin = createCredentialPayloadOrigin({
+      origin: credentialOrigin,
+      inputs: credentialInputs,
+      values,
+      onePasswordItemId,
+      singleInput,
+    });
+    if (!method || payloadOrigin === null || validating) return;
+    setValidating(true);
+    const exit = await doValidate({
+      payload: {
+        owner,
+        integration,
+        template: method.template,
+        ...("from" in payloadOrigin
+          ? { from: payloadOrigin.from }
+          : { values: payloadOrigin.values }),
+      },
+    });
+    setValidating(false);
+    if (Exit.isFailure(exit)) {
+      setValidationResult(null);
+      toast.error(messageFromExit(exit, "Couldn't validate the key"));
+      return;
+    }
+    const result = exit.value;
+    setValidationResult(result);
+    const identity = result.identity?.trim();
+    if (
+      result.status === "healthy" &&
+      identity &&
+      identity.length > 0 &&
+      (label.trim().length === 0 || nameAutofilled)
+    ) {
+      setLabel(identity);
+      setNameAutofilled(true);
+    }
+  };
+
+  // Auto-validate when a credential field loses focus: realizes "paste the key
+  // and it validates + names itself". Only fires once the credential is complete
+  // and not already probed (we clear the result on edit), so it never hammers
+  // the upstream while typing a multi-field credential.
+  const maybeAutoValidate = (): void => {
+    if (!hasHealthCheck || validating || validationResult !== null) return;
+    if (credentialPayloadOrigin === null) return;
+    void handleValidate();
   };
 
   const handleOAuthConnect = async () => {
@@ -1282,25 +1412,6 @@ export function AddAccountModal(props: {
             </DialogHeader>
 
             <div className="flex w-full min-w-0 flex-col gap-5">
-              <div className="space-y-2">
-                <StepHeader
-                  index={1}
-                  label="Display name"
-                  hint="how you'll tell accounts apart"
-                  htmlFor="connection-name"
-                />
-                <Input
-                  id="connection-name"
-                  placeholder={connectionLabelForHost("", owner, integrationName, organizationId)}
-                  value={label}
-                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => setLabel(e.target.value)}
-                />
-                <p className="text-xs text-muted-foreground">
-                  This connection will be callable as{" "}
-                  <span className="font-mono text-foreground">{String(callableName)}</span>.
-                </p>
-              </div>
-
               {(!dcrActive || createCustomMethod) && (
                 <Tabs
                   value={methodId}
@@ -1375,7 +1486,7 @@ export function AddAccountModal(props: {
 
                       {!isNoAuth && (
                         <div className="space-y-2">
-                          <StepHeader index={2} label={isOAuth ? "OAuth app" : "Credential"} />
+                          <StepHeader index={1} label={isOAuth ? "OAuth app" : "Credential"} />
 
                           {isOAuth && method ? (
                             dcrActive ? (
@@ -1475,19 +1586,58 @@ export function AddAccountModal(props: {
                               </div>
                             )
                           ) : (
-                            <CredentialValueFields
-                              inputs={credentialInputs}
-                              singleInput={singleInput}
-                              values={values}
-                              onValuesChange={setValues}
-                              origin={credentialOrigin}
-                              onOriginChange={(next) => {
-                                setCredentialOrigin(next);
-                                if (next === "paste") setOnePasswordItemId("");
-                              }}
-                              onePasswordItemId={onePasswordItemId}
-                              onOnePasswordItemIdChange={setOnePasswordItemId}
-                            />
+                            <div className="space-y-2">
+                              <CredentialValueFields
+                                inputs={credentialInputs}
+                                singleInput={singleInput}
+                                values={values}
+                                onValuesChange={(next) => {
+                                  setValues(next);
+                                  onCredentialChanged();
+                                }}
+                                origin={credentialOrigin}
+                                onOriginChange={(next) => {
+                                  setCredentialOrigin(next);
+                                  if (next === "paste") setOnePasswordItemId("");
+                                  onCredentialChanged();
+                                }}
+                                onePasswordItemId={onePasswordItemId}
+                                onOnePasswordItemIdChange={(next) => {
+                                  setOnePasswordItemId(next);
+                                  // Clear the stale verdict; the explicit
+                                  // "Validate key" button (which reads the
+                                  // updated selection) drives the 1Password path.
+                                  onCredentialChanged();
+                                }}
+                                onPasteBlur={maybeAutoValidate}
+                              />
+                              {/* Key-first: validate the pasted credential and
+                              derive the connection name from the probed identity.
+                              Only when the integration has a health check to run
+                              against (otherwise a probe can only say "unknown"). */}
+                              {hasHealthCheck && !isNoAuth ? (
+                                <div className="flex flex-col gap-2">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <Button
+                                      type="button"
+                                      variant="outline"
+                                      size="sm"
+                                      disabled={credentialPayloadOrigin === null || validating}
+                                      onClick={() => void handleValidate()}
+                                    >
+                                      {validating ? "Checking..." : "Validate key"}
+                                    </Button>
+                                    <span className="text-xs text-muted-foreground">
+                                      Confirms the key works and names the connection.
+                                    </span>
+                                  </div>
+                                  <KeyValidationStatus
+                                    validating={validating}
+                                    result={validationResult}
+                                  />
+                                </div>
+                              ) : null}
+                            </div>
                           )}
                           {isOAuth && oauthPopup.error ? (
                             <p className="text-xs text-destructive">{oauthPopup.error}</p>
@@ -1498,6 +1648,40 @@ export function AddAccountModal(props: {
                   )}
                 </Tabs>
               )}
+
+              {/* Display name, derived after the credential: a key-first connect
+              validates the pasted credential and auto-fills this from the probed
+              identity (see `handleValidate`). It stays editable, and typing here
+              flips `nameAutofilled` off so a later probe never clobbers a chosen
+              name. With no health check there's nothing to derive from, so the
+              user names it themselves. */}
+              <div className="space-y-2">
+                <StepHeader
+                  index={2}
+                  label="Display name"
+                  hint={
+                    hasHealthCheck
+                      ? "auto-filled once you validate the key"
+                      : "how you'll tell accounts apart"
+                  }
+                  htmlFor="connection-name"
+                />
+                <Input
+                  id="connection-name"
+                  placeholder={connectionLabelForHost("", owner, integrationName, organizationId)}
+                  value={label}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                    setLabel(e.target.value);
+                    // A hand-typed name takes over: stop treating it as derived
+                    // so a later probe won't overwrite the user's choice.
+                    setNameAutofilled(false);
+                  }}
+                />
+                <p className="text-xs text-muted-foreground">
+                  This connection will be callable as{" "}
+                  <span className="font-mono text-foreground">{String(callableName)}</span>.
+                </p>
+              </div>
 
               {/* Connection saved-to. Hidden while registering a new OAuth app
               (the connection, and where it's saved, only exists once you
