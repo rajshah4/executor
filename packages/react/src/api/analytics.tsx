@@ -103,6 +103,10 @@ export interface AnalyticsEvents {
   policy_action_changed: { action: string; owner: Owner; success: boolean };
   policy_removed: { owner: Owner; success: boolean };
   policy_reordered: { owner: Owner; direction: "up" | "down"; success: boolean };
+  // Row's Duplicate menu — fires when the form is prefilled, BEFORE the
+  // duplicated row is submitted. Drop in `success` if Duplicate ever becomes
+  // a server call (today the form-fill is purely client-side).
+  policy_duplicated: { action: string; owner: Owner };
 
   // ── API keys ─────────────────────────────────────────────────────────────
   api_key_created: { success: boolean };
