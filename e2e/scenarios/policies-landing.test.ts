@@ -36,23 +36,28 @@ scenario(
       });
 
       await step("The page explains what policies are for", async () => {
+        // The rationale is a paragraph beneath the h1, not anywhere else; scope
+        // to <p> so a future tooltip with the same words can't satisfy the
+        // assertion.
         await page
+          .locator("p")
           .getByText(/Override default approval behavior for tools/i)
-          .first()
           .waitFor();
       });
 
       await step("The empty state spells out the no-rule fallback", async () => {
-        await page.getByText("Active policies").first().waitFor();
-        const emptyCopy = page.getByText(
-          "No policies yet. Tools fall back to their plugin's default approval behavior.",
-          { exact: true },
-        );
-        await emptyCopy.waitFor();
-        expect(
-          await emptyCopy.isVisible(),
-          "the empty-state explainer is rendered, not just present",
-        ).toBe(true);
+        // CardStackHeader has no semantic role (a styled span), so scope by its
+        // data-slot rather than relying on a bare text match.
+        await page
+          .locator('[data-slot="card-stack-header"]')
+          .getByText("Active policies", { exact: true })
+          .waitFor();
+        await page
+          .getByText(
+            "No policies yet. Tools fall back to their plugin's default approval behavior.",
+            { exact: true },
+          )
+          .waitFor();
       });
 
       await step("The add-policy form is reachable from the same view", async () => {
@@ -60,12 +65,14 @@ scenario(
         await patternInput.waitFor();
         const addButton = page.getByRole("button", { name: "Add policy", exact: true });
         await addButton.waitFor();
-        // Pattern is empty by default, so the submit button advertises the
-        // form's gated state rather than letting an empty rule through.
+        // Pattern is empty by default, so the submit button's HTML `disabled`
+        // attribute is present (the empty string) until a pattern is typed.
+        // Reading the attribute lets a failure print the actual element state
+        // instead of a bare `false`.
         expect(
-          await addButton.isDisabled(),
-          "Add policy is disabled until a pattern is typed",
-        ).toBe(true);
+          await addButton.getAttribute("disabled"),
+          "Add policy is gated until a pattern is typed",
+        ).toBe("");
       });
     });
   }),
